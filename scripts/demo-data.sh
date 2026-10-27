@@ -49,17 +49,56 @@ ATTACKER_IP="185.220.101.45"
 # ---------------------------------------------------------------- helpers
 api() { curl -sk -u "admin:${SPLUNK_PASSWORD}" "$@"; }
 
+SPLUNK_DB_DIR="/opt/splunk/var/lib/splunk"
+
+# The index exists once its data directory does (no API auth needed to check).
+# "main" lives in defaultdb rather than main/.
+index_exists() {
+  [ "$INDEX" = "main" ] && return 0
+  docker exec splunk test -d "$SPLUNK_DB_DIR/$INDEX/db" 2>/dev/null
+}
+
+wait_healthy() {
+  for _ in $(seq 1 60); do
+    [ "$(docker inspect -f '{{.State.Health.Status}}' splunk 2>/dev/null)" = "healthy" ] && \
+      curl -fs -o /dev/null "$HEC_URL/services/collector/health" && return 0
+    sleep 5
+  done
+  return 1
+}
+
+# Creates the index, trying (1) REST API, (2) Splunk CLI, (3) an indexes.conf
+# app + restart. Stops the script if none work, so no events are sent into the void.
 ensure_index() {
+  index_exists && return 0
+  echo "Creating index '$INDEX'..."
+
   local code
-  code=$(api -o /dev/null -w "%{http_code}" "$MGMT_URL/services/data/indexes/$INDEX" || true)
-  if [ "$code" != "200" ]; then
-    code=$(api -o /dev/null -w "%{http_code}" "$MGMT_URL/services/data/indexes" -d name="$INDEX" || true)
-    if [ "$code" = "201" ] || [ "$code" = "200" ]; then
-      echo "Created index '$INDEX'"
-    else
-      echo "Warning: couldn't create index '$INDEX' (HTTP $code). Create it in Settings -> Indexes." >&2
-    fi
-  fi
+  code=$(api -o /dev/null -w "%{http_code}" "$MGMT_URL/services/data/indexes" -d name="$INDEX" || true)
+  sleep 2
+  if index_exists; then echo "Created index '$INDEX' (REST API)"; return 0; fi
+  echo "  REST API returned HTTP $code - trying the Splunk CLI..."
+
+  docker exec -u splunk splunk /opt/splunk/bin/splunk add index "$INDEX" \
+    -auth "admin:${SPLUNK_PASSWORD}" >/dev/null 2>&1 || true
+  sleep 2
+  if index_exists; then echo "Created index '$INDEX' (CLI)"; return 0; fi
+  echo "  CLI didn't work either - adding indexes.conf and restarting Splunk (1-2 min)..."
+
+  docker exec -i -u root splunk bash -c \
+    "mkdir -p /opt/splunk/etc/apps/demo_index/local && cat > /opt/splunk/etc/apps/demo_index/local/indexes.conf && chown -R splunk:splunk /opt/splunk/etc/apps/demo_index" <<EOF
+[$INDEX]
+homePath   = \$SPLUNK_DB/$INDEX/db
+coldPath   = \$SPLUNK_DB/$INDEX/colddb
+thawedPath = \$SPLUNK_DB/$INDEX/thaweddb
+EOF
+  docker compose restart splunk >/dev/null
+  wait_healthy || true
+  if index_exists; then echo "Created index '$INDEX' (indexes.conf)"; return 0; fi
+
+  echo "ERROR: couldn't create index '$INDEX'. Create it in Splunk Web (Settings -> Indexes -> New Index)" >&2
+  echo "       or rerun with DEMO_INDEX=main. No events were sent." >&2
+  exit 1
 }
 
 flush() {
@@ -205,17 +244,23 @@ live() {
 reset() {
   read -r -p "Delete ALL data in index '$INDEX'? [y/N] " ans
   [[ "$ans" =~ ^[Yy]$ ]] || { echo "Aborted."; exit 1; }
-  api -o /dev/null -X DELETE "$MGMT_URL/services/data/indexes/$INDEX" || true
-  sleep 3
+  [ "$INDEX" = "main" ] && { echo "Refusing to wipe index 'main'."; exit 1; }
+  # Stop Splunk, delete the index's data directory straight from the volume,
+  # and start again - Splunk recreates it empty. No API credentials needed.
+  echo "Stopping Splunk..."
+  docker compose stop splunk >/dev/null
+  docker run --rm -v splunk-var:/splunkvar alpine rm -rf "/splunkvar/lib/splunk/$INDEX"
+  echo "Starting Splunk (1-2 min)..."
+  docker compose start splunk >/dev/null
+  wait_healthy || true
   ensure_index
   echo "Index '$INDEX' reset."
 }
 
 # ---------------------------------------------------------------- main
-ensure_index
 case "$MODE" in
-  backfill) backfill ;;
-  live)     live ;;
+  backfill) ensure_index; backfill ;;
+  live)     ensure_index; live ;;
   reset)    reset ;;
   *) echo "Usage: $0 [backfill|live|reset]"; exit 1 ;;
 esac
