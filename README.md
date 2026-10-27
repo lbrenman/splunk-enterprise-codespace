@@ -50,6 +50,7 @@ cat .env
 │   ├── status.sh           # health, Web/HEC reachability, volumes
 │   ├── logs.sh             # follow container logs
 │   ├── test-hec.sh         # send a test event to HEC
+│   ├── demo-data.sh        # generate realistic demo data (see "Demo: seeing the value of Splunk")
 │   ├── backup.sh           # tar.gz backup of all Splunk data to ./backups
 │   ├── restore.sh          # restore from a backup
 │   └── reset.sh            # wipe everything and start fresh
@@ -197,6 +198,254 @@ curl -sk -u admin:$SPLUNK_PASSWORD \
 - **Wait a few seconds** — events take a moment to become searchable.
 - **Widen the time range** — events are timestamped on receipt in the container's time zone (`TZ` in `.env`, default `America/New_York`). Try **All time**.
 - **Check the index** — the `index` in your payload must exist; `main` always does.
+
+---
+
+## Demo: seeing the value of Splunk
+
+Sending a single `{"action":"login"}` event doesn't show much. Splunk's value shows up when you have **lots of machine data from different systems**. It lets you ask questions you didn't plan for and **correlate across sources** in seconds, with no schema or data model defined up front.
+
+This demo simulates a small API-driven business. It's the kind of landscape an iPaaS / API management platform sits in the middle of:
+
+| Sourcetype | What it represents |
+|---|---|
+| `api:access` | API gateway access logs: endpoint, status, latency, bytes, client app, client IP, trace ID |
+| `integration:run` | Integration flow executions: order sync to SAP, customer sync from Salesforce |
+| `business:order` | Orders placed, with amount, product, region |
+| `auth` | Admin console login attempts |
+
+Two incidents are hidden in the data for you to find:
+
+1. **An outage 2–3 hours ago.** `/orders` starts returning 503s. *Why?* And *what did it cost?*
+2. **A security incident ~90 minutes ago.** Someone brute-forces the `admin` login, gets in, and bulk-downloads customer data.
+
+### Step 1 — Load the data
+
+```bash
+./scripts/demo-data.sh           # ~5,700 events spread over the last 24 hours, into index=demo
+./scripts/demo-data.sh live      # optional: stream live traffic every second (Ctrl+C to stop)
+./scripts/demo-data.sh reset     # wipe the demo index and start over
+```
+
+In **Search & Reporting**, set the time picker to **Last 24 hours** for everything below.
+
+> The script sends batches of events with `curl` to HEC, back-dating them with the `"time"` field. You can send the same shape of events from your own systems. Here's one of each:
+
+```bash
+source .env
+HEC="http://localhost:8088/services/collector/event"
+AUTH="Authorization: Splunk $SPLUNK_HEC_TOKEN"
+
+# API gateway access log
+curl -s $HEC -H "$AUTH" -d '{"index":"demo","sourcetype":"api:access","event":{"method":"POST","path":"/orders","status":200,"latency_ms":182,"bytes":734,"client_app":"partner-acme","client_ip":"8.8.8.8","region":"us-east","trace_id":"a1b2c3d4"}}'
+
+# Integration flow run (same trace_id = same transaction)
+curl -s $HEC -H "$AUTH" -d '{"index":"demo","sourcetype":"integration:run","event":{"flow":"order-sync-to-SAP","target":"SAP S/4HANA","status":"success","duration_ms":640,"records":1,"trace_id":"a1b2c3d4"}}'
+
+# Business event
+curl -s $HEC -H "$AUTH" -d '{"index":"demo","sourcetype":"business:order","event":{"order_id":"ORD-000123","amount":249.99,"currency":"USD","product":"Widget","region":"us-east","client_app":"partner-acme","trace_id":"a1b2c3d4"}}'
+
+# Login attempt
+curl -s $HEC -H "$AUTH" -d '{"index":"demo","sourcetype":"auth","event":{"user":"alice","result":"failure","reason":"bad_password","client_ip":"8.8.8.8","app":"admin-console"}}'
+
+# Several events in one request (batching) with explicit timestamps (epoch seconds)
+curl -s $HEC -H "$AUTH" -d "
+{\"time\":$(date -d '-10 min' +%s),\"index\":\"demo\",\"sourcetype\":\"auth\",\"event\":{\"user\":\"bob\",\"result\":\"success\",\"client_ip\":\"1.1.1.1\"}}
+{\"time\":$(date -d '-5 min' +%s),\"index\":\"demo\",\"sourcetype\":\"auth\",\"event\":{\"user\":\"bob\",\"result\":\"success\",\"client_ip\":\"1.1.1.1\"}}"
+```
+
+### Step 2 — What do we have?
+
+```
+index=demo | stats count by sourcetype
+```
+
+```
+index=demo sourcetype=api:access | head 20
+```
+
+Click any event and expand it. Every JSON key is already a searchable field, with no parsing rules or table schema needed. The **fields sidebar** on the left shows the top values for each field. Click `status` or `client_app` to see the distribution instantly.
+
+### Step 3 — Operations: is the API healthy?
+
+**Error rate over time.** Switch to the **Visualization** tab and choose a line chart:
+
+```
+index=demo sourcetype=api:access
+| timechart span=15m count as requests count(eval(status>=500)) as errors
+| eval error_rate_pct=round(errors/requests*100,1)
+| fields _time error_rate_pct
+```
+
+➡ You'll see a clear spike 2–3 hours ago.
+
+**Latency percentiles per endpoint** (the SLA view):
+
+```
+index=demo sourcetype=api:access
+| eval endpoint=method." ".path
+| stats count as calls p50(latency_ms) as p50_ms p95(latency_ms) as p95_ms max(latency_ms) as max_ms by endpoint
+| sort - p95_ms
+```
+
+**Which endpoint broke, and when?** Use a column or line chart:
+
+```
+index=demo sourcetype=api:access status>=500
+| timechart span=10m count by path
+```
+
+**What's the error?**
+
+```
+index=demo sourcetype=api:access status>=500
+| stats count by path status error
+| sort - count
+```
+
+➡ `Upstream timeout: order-sync-to-SAP`. The API is only the messenger.
+
+### Step 4 — Root cause: correlate across systems
+
+The API gateway and the integration platform are different systems with different logs. They share a `trace_id`, so Splunk can join them on the fly:
+
+```
+index=demo (sourcetype=api:access status>=500) OR (sourcetype=integration:run status=failed)
+| stats values(sourcetype) as seen_in values(path) as api_path values(flow) as flow values(target) as target values(error) as errors dc(sourcetype) as systems by trace_id
+| where systems=2
+```
+
+Then summarize the failing integration:
+
+```
+index=demo sourcetype=integration:run
+| timechart span=15m count by status
+```
+
+```
+index=demo sourcetype=integration:run status=failed
+| stats count min(_time) as first_failure max(_time) as last_failure by flow target error
+| convert ctime(first_failure) ctime(last_failure)
+```
+
+➡ **Root cause:** the order-sync-to-SAP flow timed out against SAP. You also get the exact start and end of the outage. It took a few searches, with no war room and no SSH-ing into boxes.
+
+### Step 5 — Business impact: what did it cost?
+
+**Revenue over time.** The dip lines up with the outage:
+
+```
+index=demo sourcetype=business:order
+| timechart span=15m sum(amount) as revenue count as orders
+```
+
+**Estimated lost revenue** = failed order attempts × average order value:
+
+```
+index=demo sourcetype=api:access method=POST path=/orders status>=500
+| stats count as failed_orders
+| appendcols [ search index=demo sourcetype=business:order | stats avg(amount) as avg_order_value ]
+| eval estimated_lost_revenue="$".tostring(round(failed_orders*avg_order_value,2),"commas")
+```
+
+**Which partners were affected?** This is useful for proactive customer communication:
+
+```
+index=demo sourcetype=api:access path=/orders status>=500
+| stats count as failed_calls by client_app
+| sort - failed_calls
+```
+
+➡ This connects *technical* data (HTTP 503s) to *business* data (dollars). Turning IT events into business metrics is a big part of what people pay Splunk for.
+
+### Step 6 — Security: detect the attack
+
+**Brute-force detection.** Find IPs with lots of failed logins:
+
+```
+index=demo sourcetype=auth result=failure
+| stats count as failures dc(user) as users_tried values(user) as users min(_time) as first max(_time) as last by client_ip
+| where failures > 10
+| convert ctime(first) ctime(last)
+```
+
+**Did they get in?** Look for failures followed by a success from the same IP:
+
+```
+index=demo sourcetype=auth
+| stats count(eval(result="failure")) as failures count(eval(result="success")) as successes values(user) as users by client_ip
+| where failures > 10 AND successes > 0
+```
+
+**Follow the attacker across systems.** This is one search across auth *and* API logs:
+
+```
+index=demo client_ip="185.220.101.45"
+| eval activity=case(sourcetype=="auth", "LOGIN ".upper(result)." user=".user, sourcetype=="api:access", method." ".path." ".coalesce(query,"")." bytes=".bytes)
+| table _time sourcetype activity
+| sort _time
+```
+
+**Data exfiltration.** Find who downloaded the most data:
+
+```
+index=demo sourcetype=api:access
+| stats sum(bytes) as total_bytes count as calls by client_ip client_app
+| eval MB=round(total_bytes/1024/1024,1)
+| sort - MB
+| head 10
+```
+
+➡ The story is a brute force, then a successful `admin` login, then ~100 MB of `/customers` data pulled by an `unknown` client. That's a breach investigation reconstructed in minutes from logs you were already collecting.
+
+### Step 7 — Usage analytics, geo and anomalies
+
+**Partner / app usage and quality of service:**
+
+```
+index=demo sourcetype=api:access
+| stats count as calls count(eval(status>=500)) as errors avg(latency_ms) as avg_latency_ms by client_app
+| eval error_pct=round(errors/calls*100,2), avg_latency_ms=round(avg_latency_ms)
+| sort - calls
+```
+
+**Where is traffic coming from?** Use the **Visualization** tab and choose **Cluster Map**:
+
+```
+index=demo sourcetype=api:access
+| iplocation client_ip
+| geostats count by client_app
+```
+
+**Statistical anomaly detection.** Flag 10-minute windows where latency is more than 2 standard deviations above normal:
+
+```
+index=demo sourcetype=api:access
+| timechart span=10m avg(latency_ms) as avg_latency
+| eventstats avg(avg_latency) as mean stdev(avg_latency) as sd
+| eval threshold=round(mean+2*sd), avg_latency=round(avg_latency)
+| where avg_latency > threshold
+```
+
+**Real-time view** while `./scripts/demo-data.sh live` is running. Set the time picker to **Real-time → 1 minute window**:
+
+```
+index=demo sourcetype=api:access
+| timechart span=5s count by status
+```
+
+### Step 8 — Make it a dashboard
+
+Run any search above, then choose **Save As → Dashboard Panel → New Dashboard** (e.g. "API Operations"). Add the error-rate, revenue, failed-logins and partner-usage searches as panels. You end up with one screen showing ops, business and security together, built from raw logs in a few minutes.
+
+> **Splunk Free vs. trial:** Free supports searches and dashboards. **Alerts** (e.g. "email me when error_rate_pct > 5" or "when failures > 10 from one IP") and scheduled reports need the Enterprise trial. Set `SPLUNK_LICENSE_URI=` (empty) in `.env` and run `./scripts/reset.sh`.
+
+### Why this matters
+
+- **No schema up front.** You sent JSON, and every field was searchable immediately. Questions you didn't plan for are still answerable.
+- **Correlation across silos.** API gateway, integration platform, business events and auth logs are joined by `trace_id` or `client_ip` at search time.
+- **One tool, many audiences.** The same data answers ops (*is it up?*), engineering (*why did it break?*), business (*what did it cost?*) and security (*were we breached?*).
+- **Ingest from anywhere.** Anything that can make an HTTP POST can feed HEC, including integration flows, API gateway policies, scripts and apps.
 
 ---
 
