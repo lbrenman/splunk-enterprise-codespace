@@ -10,6 +10,9 @@ for i in $(seq 1 30); do docker info >/dev/null 2>&1 && break; sleep 2; done
 
 docker compose up -d
 
+# Make Splunk Web redirects use the Codespace URL instead of localhost
+bash scripts/configure-proxy.sh
+
 echo
 echo "Splunk is starting. First boot takes ~2-4 minutes; restarts ~1 minute."
 echo "Check progress with:  ./scripts/status.sh   or   ./scripts/logs.sh"

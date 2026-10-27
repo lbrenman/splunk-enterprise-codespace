@@ -45,6 +45,7 @@ cat .env
 ├── scripts/
 │   ├── setup.sh            # one-time: create .env, generate secrets, pull image
 │   ├── start.sh            # start Splunk (runs on every Codespace start)
+│   ├── configure-proxy.sh  # fix Splunk Web redirects behind the Codespaces proxy
 │   ├── stop.sh             # stop Splunk, keep data
 │   ├── status.sh           # health, Web/HEC reachability, volumes
 │   ├── logs.sh             # follow container logs
@@ -219,6 +220,7 @@ docker exec -it splunk sudo -u splunk /opt/splunk/bin/splunk status
 
 | Symptom | Fix |
 |---------|-----|
+| Clicking port 8000 jumps to `localhost:8000` / "not ready" | Splunk Web is redirecting to localhost. Run `./scripts/configure-proxy.sh` (runs automatically on start) — it sets `tools.proxy.base` to the Codespace URL in a small `codespace_proxy` app |
 | Port 8000 shows 502 / not responding | Splunk is still booting — run `./scripts/status.sh`, wait 2–4 min on first boot |
 | Container exits immediately | `./scripts/logs.sh` — usually a password under 8 characters or a license-acceptance error |
 | `minimum free disk space` error | Splunk needs ≥5 GB free: `df -h`, delete old backups, or use a larger machine |
