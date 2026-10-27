@@ -5,6 +5,12 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 set -a; source .env; set +a
 
+if [ "$SPLUNK_HEC_TOKEN" = "00000000-0000-0000-0000-000000000000" ]; then
+  echo "WARNING: your HEC token is the placeholder from .env.example - anyone could guess it."
+  echo "         Run ./scripts/rotate-hec-token.sh first, then rerun this script."
+  echo
+fi
+
 if [ -n "${CODESPACE_NAME:-}" ]; then
   URL="https://${CODESPACE_NAME}-8088.${GITHUB_CODESPACES_PORT_FORWARDING_DOMAIN:-app.github.dev}"
 else

@@ -51,6 +51,7 @@ cat .env
 │   ├── logs.sh             # follow container logs
 │   ├── test-hec.sh         # send a test event to HEC
 │   ├── hec-info.sh         # print the public HEC URL + token for sending from outside
+│   ├── rotate-hec-token.sh # replace the HEC token (in .env and in Splunk) and verify it
 │   ├── app-emulator.sh     # portable app emulator (bash + curl) - run it from your laptop
 │   ├── demo-data.sh        # in-Codespace wrapper: create demo index, run emulator, verify, reset
 │   ├── backup.sh           # tar.gz backup of all Splunk data to ./backups
@@ -610,6 +611,7 @@ docker exec -it splunk sudo -u splunk /opt/splunk/bin/splunk status
 | `scripts/start.sh: Permission denied` | `chmod +x scripts/*.sh` (or run with `bash scripts/start.sh`); to fix permanently: `git update-index --chmod=+x scripts/*.sh` and commit |
 | REST call to `localhost:8089` returns `401` (even with the right password) | Expected on the Free license — remote management is disabled. Run it inside the container: `docker exec splunk sh -c 'curl -sk -u "admin:$SPLUNK_PASSWORD" https://localhost:8089/...'` |
 | `Requires license feature='Auth'` when changing the password | The Free license has no user management, so the admin password can't be changed. Use the Enterprise trial if you need it |
+| `hec-info.sh` warns the token is the placeholder (all zeros) | Run `./scripts/rotate-hec-token.sh` — it sets a new random token in `.env` and Splunk and verifies it. Then update any senders with the new token |
 | Container exits immediately | `./scripts/logs.sh` — usually a password under 8 characters or a license-acceptance error |
 | `minimum free disk space` error | Splunk needs ≥5 GB free: `df -h`, delete old backups, or use a larger machine |
 | Slow / out of memory | Use a 4-core (16 GB) or larger Codespace machine type |
