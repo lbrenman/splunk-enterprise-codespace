@@ -118,7 +118,7 @@ Right-click the file in the Explorer → **Download**. To restore into a new Cod
 ./scripts/test-hec.sh "my first event"
 ```
 
-Then search in Splunk Web:
+Then search in Splunk Web (see [Finding your events](#finding-your-events)):
 
 ```
 index=main sourcetype=codespace:test
@@ -145,14 +145,58 @@ curl http://localhost:8088/services/collector/event \
 
 HEC is protected by the token, so making **8088** public is reasonable for a demo. Do **not** make **8000** public on the Free license (no login).
 
-### REST API
+A successful send returns:
+
+```json
+{"text":"Success","code":0}
+```
+
+---
+
+## Finding your events
+
+### In Splunk Web
+
+1. Open Splunk Web (PORTS tab → globe next to **8000**).
+2. Go to **Apps → Search & Reporting** (or click **Search & Reporting** on the home page).
+3. Set the time picker (right of the search bar) to **Last 15 minutes** — or **All time** if nothing shows up.
+4. Run a search:
+
+   ```
+   index=main sourcetype=_json
+   ```
+
+Events sent with `"sourcetype": "_json"` have their JSON fields extracted automatically, so you can filter on them directly:
+
+```
+index=main action=login user=demo
+```
+
+A few more useful searches:
+
+```
+index=main | stats count by sourcetype          # what's been ingested
+index=main sourcetype=_json | table _time action user
+index=main sourcetype=codespace:test            # events from ./scripts/test-hec.sh
+index=_internal sourcetype=splunkd component=HttpInputDataHandler   # HEC errors
+```
+
+### From the terminal (REST API)
 
 ```bash
 source .env
-curl -k -u admin:$SPLUNK_PASSWORD \
+curl -sk -u admin:$SPLUNK_PASSWORD \
   https://localhost:8089/services/search/jobs/export \
-  -d search="search index=main | head 5" -d output_mode=json
+  -d search="search index=main sourcetype=_json earliest=-1h" \
+  -d output_mode=json
 ```
+
+### Event not showing up?
+
+- **Check the HEC response** — anything other than `{"text":"Success","code":0}` means the event was rejected (e.g. `Invalid token`, `Incorrect index`).
+- **Wait a few seconds** — events take a moment to become searchable.
+- **Widen the time range** — events are timestamped on receipt in the container's time zone (`TZ` in `.env`, default `America/New_York`). Try **All time**.
+- **Check the index** — the `index` in your payload must exist; `main` always does.
 
 ---
 
@@ -222,6 +266,7 @@ docker exec -it splunk sudo -u splunk /opt/splunk/bin/splunk status
 |---------|-----|
 | Clicking port 8000 jumps to `localhost:8000` / "not ready" | Splunk Web is redirecting to localhost. Run `./scripts/configure-proxy.sh` (runs automatically on start) — it sets `tools.proxy.base` to the Codespace URL in a small `codespace_proxy` app |
 | Port 8000 shows 502 / not responding | Splunk is still booting — run `./scripts/status.sh`, wait 2–4 min on first boot |
+| `scripts/start.sh: Permission denied` | `chmod +x scripts/*.sh` (or run with `bash scripts/start.sh`); to fix permanently: `git update-index --chmod=+x scripts/*.sh` and commit |
 | Container exits immediately | `./scripts/logs.sh` — usually a password under 8 characters or a license-acceptance error |
 | `minimum free disk space` error | Splunk needs ≥5 GB free: `df -h`, delete old backups, or use a larger machine |
 | Slow / out of memory | Use a 4-core (16 GB) or larger Codespace machine type |
