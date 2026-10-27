@@ -24,10 +24,15 @@ SPLUNK_DB_DIR="/opt/splunk/var/lib/splunk"
 # calls that don't come from localhost (they return 401).
 api() { docker exec splunk sh -c 'curl -sk -u "admin:$SPLUNK_PASSWORD" "$@"' _ "$@"; }
 
-# The index exists once its data directory does. ("main" lives in defaultdb.)
+# True if Splunk knows the index: asks the REST API (from inside the container),
+# falling back to checking for its data directory as root. (The container's
+# default user can't read Splunk's data folders, so the check must run as root.)
 index_exists() {
   [ "$INDEX" = "main" ] && return 0
-  docker exec splunk test -d "$SPLUNK_DB_DIR/$INDEX/db" 2>/dev/null
+  local code
+  code=$(api -o /dev/null -w "%{http_code}" "$MGMT_URL/services/data/indexes/$INDEX" 2>/dev/null || true)
+  [ "$code" = "200" ] && return 0
+  docker exec -u root splunk test -d "$SPLUNK_DB_DIR/$INDEX/db" 2>/dev/null
 }
 
 wait_healthy() {

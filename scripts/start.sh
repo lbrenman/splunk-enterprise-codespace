@@ -3,10 +3,17 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
+# Log everything to splunk-start.log too (postStartCommand output isn't shown
+# in the terminal). View it with:  cat splunk-start.log
+exec > >(tee splunk-start.log) 2>&1
+echo "start.sh: $(date)"
+
 [ -f .env ] || bash scripts/setup.sh
 
-# Wait for the Docker daemon (docker-in-docker can take a few seconds)
-for i in $(seq 1 30); do docker info >/dev/null 2>&1 && break; sleep 2; done
+# Wait for the Docker daemon (docker-in-docker can take a while on a fresh Codespace)
+echo "Waiting for Docker..."
+for i in $(seq 1 90); do docker info >/dev/null 2>&1 && break; sleep 2; done
+docker info >/dev/null 2>&1 || { echo "ERROR: Docker isn't running. Try: ./scripts/start.sh"; exit 1; }
 
 docker compose up -d
 

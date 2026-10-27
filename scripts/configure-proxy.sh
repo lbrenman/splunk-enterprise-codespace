@@ -51,5 +51,12 @@ for i in $(seq 1 60); do
 done
 
 echo "Done. Open: ${BASE_URL}"
-echo "Redirect check:"
-curl -s -o /dev/null -w '  / -> %{redirect_url}\n' http://localhost:8000/ || true
+# Simulate a request arriving through the Codespaces proxy (which adds these
+# headers). A plain local curl has no proxy headers, so it would still show localhost.
+echo "Redirect check (as seen by your browser):"
+curl -s -o /dev/null -w '  / -> %{redirect_url}\n' \
+  -H "Host: ${CODESPACE_NAME}-8000.${DOMAIN}" \
+  -H "X-Forwarded-Host: ${CODESPACE_NAME}-8000.${DOMAIN}" \
+  -H "X-Forwarded-Proto: https" \
+  http://localhost:8000/ || true
+echo "  (should start with ${BASE_URL}; if it shows localhost, tell me)"
