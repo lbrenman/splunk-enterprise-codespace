@@ -1,0 +1,46 @@
+# Splunk Enterprise (Free license) for GitHub Codespaces
+# Data and config live in named Docker volumes, so they survive
+# Codespace stop/start and rebuilds. See README.md -> Persistence.
+
+services:
+  splunk:
+    image: ${SPLUNK_IMAGE:-splunk/splunk:latest}
+    container_name: splunk
+    hostname: splunk
+    platform: linux/amd64
+    restart: unless-stopped
+    environment:
+      # Required license acceptance flags
+      SPLUNK_START_ARGS: "--accept-license"
+      SPLUNK_GENERAL_TERMS: "--accept-sgt-current-at-splunk-com"
+      # Admin password (min 8 chars) - set in .env
+      SPLUNK_PASSWORD: ${SPLUNK_PASSWORD:?Set SPLUNK_PASSWORD in .env}
+      # "Free" = Splunk Free license (500 MB/day, no auth on Splunk Web).
+      # Leave empty in .env to use the 60-day Enterprise trial instead.
+      SPLUNK_LICENSE_URI: ${SPLUNK_LICENSE_URI:-Free}
+      # HTTP Event Collector
+      SPLUNK_HEC_TOKEN: ${SPLUNK_HEC_TOKEN:-}
+      SPLUNK_HEC_SSL: ${SPLUNK_HEC_SSL:-false}
+      # Serve Splunk Web over plain HTTP; Codespaces port forwarding adds HTTPS
+      SPLUNK_HTTP_ENABLESSL: "false"
+      TZ: ${TZ:-America/New_York}
+    ports:
+      - "8000:8000"   # Splunk Web
+      - "8088:8088"   # HTTP Event Collector (HEC)
+      - "8089:8089"   # Management / REST API (HTTPS)
+      - "9997:9997"   # Forwarder receiving
+    volumes:
+      - splunk-etc:/opt/splunk/etc   # config, apps, users, saved searches
+      - splunk-var:/opt/splunk/var   # indexes (your data), KV store, logs
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fs http://localhost:8000/en-US/account/login > /dev/null || curl -fs http://localhost:8000 > /dev/null"]
+      interval: 30s
+      timeout: 10s
+      retries: 20
+      start_period: 180s
+
+volumes:
+  splunk-etc:
+    name: splunk-etc
+  splunk-var:
+    name: splunk-var

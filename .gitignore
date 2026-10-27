@@ -1,0 +1,19 @@
+# Secrets
+.env
+*.env.local
+
+# Backups and any local data
+backups/
+splunk-data/
+*.tar.gz
+
+# Logs
+*.log
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/*
+!.vscode/extensions.json
+.idea/
+*.swp
