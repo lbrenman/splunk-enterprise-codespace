@@ -32,7 +32,7 @@ cat .env
 - **Password:** value of `SPLUNK_PASSWORD`
 - **HEC token:** value of `SPLUNK_HEC_TOKEN`
 
-> **Splunk Free has no login screen** — Splunk Web opens directly as admin. The password is still used for the REST API (port 8089) and CLI. Keep port 8000 **Private** (the Codespaces default) — see [Security](#security).
+> **Splunk Free has no login screen.** Splunk Web opens directly as admin. The password is only used for the CLI and REST API *from inside the container* (see [From the terminal](#from-the-terminal-rest-api)). It **can't be changed** on the Free license ("Requires license feature='Auth'"). Keep port 8000 **Private** (the Codespaces default); see [Security](#security).
 
 ---
 
@@ -50,7 +50,9 @@ cat .env
 │   ├── status.sh           # health, Web/HEC reachability, volumes
 │   ├── logs.sh             # follow container logs
 │   ├── test-hec.sh         # send a test event to HEC
-│   ├── demo-data.sh        # generate realistic demo data (see "Demo: seeing the value of Splunk")
+│   ├── hec-info.sh         # print the public HEC URL + token for sending from outside
+│   ├── app-emulator.sh     # portable app emulator (bash + curl) - run it from your laptop
+│   ├── demo-data.sh        # in-Codespace wrapper: create demo index, run emulator, verify, reset
 │   ├── backup.sh           # tar.gz backup of all Splunk data to ./backups
 │   ├── restore.sh          # restore from a backup
 │   └── reset.sh            # wipe everything and start fresh
@@ -136,15 +138,27 @@ curl http://localhost:8088/services/collector/event \
 
 ### From outside the Codespace (e.g. a cloud integration)
 
-1. In the **PORTS** tab, right-click port **8088** → **Port Visibility → Public**.
-2. Use the forwarded URL:
-   ```
-   POST https://<codespace-name>-8088.app.github.dev/services/collector/event
-   Authorization: Splunk <SPLUNK_HEC_TOKEN>
-   ```
-3. Set it back to **Private** when finished.
+`start.sh` makes port **8088 Public** automatically on every start. If it couldn't, do it yourself: **PORTS** tab → right-click **8088** → **Port Visibility → Public**.
 
-HEC is protected by the token, so making **8088** public is reasonable for a demo. Do **not** make **8000** public on the Free license (no login).
+In the Codespace terminal, run:
+
+```bash
+./scripts/hec-info.sh
+```
+
+It prints ready-to-paste `export HEC_URL=...` / `export HEC_TOKEN=...` lines and a test `curl` to run on your laptop or any other machine:
+
+```
+POST https://<codespace-name>-8088.app.github.dev/services/collector/event
+Authorization: Splunk <SPLUNK_HEC_TOKEN>
+```
+
+The HEC token protects port 8088, so making it public is reasonable for a demo. Do **not** make **8000** public on the Free license, because it has no login.
+
+Keep in mind:
+- **The Codespace must be running.** It stops after 30 minutes idle by default, and incoming HEC traffic doesn't count as activity. You can raise this (max 240 min) under GitHub **Settings → Codespaces → Default idle timeout**.
+- **The URL is tied to this Codespace.** A new Codespace has a new URL and a new token.
+- **Use an existing index.** Events sent to a non-existent index are silently dropped even though HEC says `Success`. `main` always exists; `start.sh` also creates `demo`.
 
 A successful send returns:
 
@@ -184,13 +198,22 @@ index=_internal sourcetype=splunkd component=HttpInputDataHandler   # HEC errors
 
 ### From the terminal (REST API)
 
+On the **Free license, Splunk only accepts REST/CLI calls from inside the container**. Calls from the Codespace terminal count as "remote" and get `401`. Run them through `docker exec`. `$SPLUNK_PASSWORD` is expanded inside the container, so no quoting issues:
+
 ```bash
-source .env
-curl -sk -u admin:$SPLUNK_PASSWORD \
+docker exec splunk sh -c 'curl -sk -u "admin:$SPLUNK_PASSWORD" \
   https://localhost:8089/services/search/jobs/export \
   -d search="search index=main sourcetype=_json earliest=-1h" \
-  -d output_mode=json
+  -d output_mode=json'
 ```
+
+The CLI works the same way:
+
+```bash
+docker exec -u splunk splunk sh -c '/opt/splunk/bin/splunk search "index=main | head 5" -auth "admin:$SPLUNK_PASSWORD"'
+```
+
+> With the Enterprise trial license (`SPLUNK_LICENSE_URI=` empty), remote REST works directly with `curl -sk -u admin:<password> https://localhost:8089/...`.
 
 ### Event not showing up?
 
@@ -214,45 +237,78 @@ This demo simulates a small API-driven business. It's the kind of landscape an i
 | `business:order` | Orders placed, with amount, product, region |
 | `auth` | Admin console login attempts |
 
-Two incidents are hidden in the data for you to find:
+You'll play both roles: **the app** (sending data from your laptop) and **the analyst** (searching in Splunk Web to figure out what happened).
 
-1. **An outage 2–3 hours ago.** `/orders` starts returning 503s. *Why?* And *what did it cost?*
-2. **A security incident ~90 minutes ago.** Someone brute-forces the `admin` login, gets in, and bulk-downloads customer data.
+### Step 1 — Send data from outside, like a real app
 
-### Step 1 — Load the data
+All of this runs on **your laptop**, or any machine with `bash` and `curl` (macOS, Linux, WSL). Nothing runs inside the Codespace except Splunk.
+
+**1a. Get the connection details.** In the Codespace terminal:
 
 ```bash
-./scripts/demo-data.sh           # ~5,700 events spread over the last 24 hours, into index=demo
-./scripts/demo-data.sh live      # optional: stream live traffic every second (Ctrl+C to stop)
-./scripts/demo-data.sh reset     # wipe the demo index and start over
+./scripts/hec-info.sh
 ```
 
-In **Search & Reporting**, set the time picker to **Last 24 hours** for everything below.
-
-> The script sends batches of events with `curl` to HEC, back-dating them with the `"time"` field. You can send the same shape of events from your own systems. Here's one of each:
+Copy the two `export` lines it prints and paste them into a terminal on your laptop:
 
 ```bash
-source .env
-HEC="http://localhost:8088/services/collector/event"
-AUTH="Authorization: Splunk $SPLUNK_HEC_TOKEN"
+export HEC_URL=https://<codespace-name>-8088.app.github.dev
+export HEC_TOKEN=<your token>
+```
 
+**1b. Send events by hand** to see exactly what an app sends. This is one of each type:
+
+```bash
 # API gateway access log
-curl -s $HEC -H "$AUTH" -d '{"index":"demo","sourcetype":"api:access","event":{"method":"POST","path":"/orders","status":200,"latency_ms":182,"bytes":734,"client_app":"partner-acme","client_ip":"8.8.8.8","region":"us-east","trace_id":"a1b2c3d4"}}'
+curl -s $HEC_URL/services/collector/event -H "Authorization: Splunk $HEC_TOKEN" \
+  -d '{"index":"demo","sourcetype":"api:access","event":{"method":"POST","path":"/orders","status":200,"latency_ms":182,"bytes":734,"client_app":"partner-acme","client_ip":"8.8.8.8","region":"us-east","trace_id":"a1b2c3d4"}}'
 
-# Integration flow run (same trace_id = same transaction)
-curl -s $HEC -H "$AUTH" -d '{"index":"demo","sourcetype":"integration:run","event":{"flow":"order-sync-to-SAP","target":"SAP S/4HANA","status":"success","duration_ms":640,"records":1,"trace_id":"a1b2c3d4"}}'
+# Integration flow run (same trace_id = same business transaction)
+curl -s $HEC_URL/services/collector/event -H "Authorization: Splunk $HEC_TOKEN" \
+  -d '{"index":"demo","sourcetype":"integration:run","event":{"flow":"order-sync-to-SAP","target":"SAP S/4HANA","status":"success","duration_ms":640,"records":1,"trace_id":"a1b2c3d4"}}'
 
 # Business event
-curl -s $HEC -H "$AUTH" -d '{"index":"demo","sourcetype":"business:order","event":{"order_id":"ORD-000123","amount":249.99,"currency":"USD","product":"Widget","region":"us-east","client_app":"partner-acme","trace_id":"a1b2c3d4"}}'
+curl -s $HEC_URL/services/collector/event -H "Authorization: Splunk $HEC_TOKEN" \
+  -d '{"index":"demo","sourcetype":"business:order","event":{"order_id":"ORD-000123","amount":249.99,"currency":"USD","product":"Widget","region":"us-east","client_app":"partner-acme","trace_id":"a1b2c3d4"}}'
 
 # Login attempt
-curl -s $HEC -H "$AUTH" -d '{"index":"demo","sourcetype":"auth","event":{"user":"alice","result":"failure","reason":"bad_password","client_ip":"8.8.8.8","app":"admin-console"}}'
+curl -s $HEC_URL/services/collector/event -H "Authorization: Splunk $HEC_TOKEN" \
+  -d '{"index":"demo","sourcetype":"auth","event":{"user":"alice","result":"failure","reason":"bad_password","client_ip":"8.8.8.8","app":"admin-console"}}'
 
-# Several events in one request (batching) with explicit timestamps (epoch seconds)
-curl -s $HEC -H "$AUTH" -d "
-{\"time\":$(date -d '-10 min' +%s),\"index\":\"demo\",\"sourcetype\":\"auth\",\"event\":{\"user\":\"bob\",\"result\":\"success\",\"client_ip\":\"1.1.1.1\"}}
-{\"time\":$(date -d '-5 min' +%s),\"index\":\"demo\",\"sourcetype\":\"auth\",\"event\":{\"user\":\"bob\",\"result\":\"success\",\"client_ip\":\"1.1.1.1\"}}"
+# Batch: several events in one request, with explicit timestamps (epoch seconds)
+NOW=$(date +%s)
+curl -s $HEC_URL/services/collector/event -H "Authorization: Splunk $HEC_TOKEN" -d "
+{\"time\":$((NOW-600)),\"index\":\"demo\",\"sourcetype\":\"auth\",\"event\":{\"user\":\"bob\",\"result\":\"success\",\"client_ip\":\"1.1.1.1\"}}
+{\"time\":$((NOW-300)),\"index\":\"demo\",\"sourcetype\":\"auth\",\"event\":{\"user\":\"bob\",\"result\":\"success\",\"client_ip\":\"1.1.1.1\"}}"
 ```
+
+Each call should return `{"text":"Success","code":0}`. In Splunk Web, search `index=demo` with the time range **Last 15 minutes** and you'll see them.
+
+**1c. Run the app emulator** for realistic volume. Download it to your laptop:
+
+```bash
+curl -sO https://raw.githubusercontent.com/lbrenman/splunk-enterprise-codespace/main/scripts/app-emulator.sh
+chmod +x app-emulator.sh
+```
+
+Then pick a mode:
+
+| Command | What it emulates |
+|---|---|
+| `./app-emulator.sh backfill` | 24 hours of history (~5,700 events), including a past outage and a past attack. **Start here** so the searches below have data. |
+| `./app-emulator.sh live` | The app running now: ~5 API calls/sec plus logins and integration runs. Leave it running in one terminal. |
+| `./app-emulator.sh outage` | Run in a **second** terminal while `live` runs. `/orders` breaks for 3 minutes. |
+| `./app-emulator.sh attack` | Run in a **second** terminal. A brute-force login, a successful break-in, then bulk data theft over ~2 minutes. |
+
+Options: `RATE=20 ./app-emulator.sh live` for more traffic; `INDEX=main ./app-emulator.sh ...` to use the `main` index.
+
+The planted incidents in the backfilled history:
+1. **An outage 2–3 hours ago.** `/orders` returns 503s. *Why?* And *what did it cost?*
+2. **A security incident ~90 minutes ago.** Brute force against `admin`, a successful login, then bulk download of customer data.
+
+In **Search & Reporting**, set the time picker to **Last 24 hours** for Steps 2–8.
+
+> Inside the Codespace you can do the same with `./scripts/demo-data.sh [backfill|live|outage|attack]`. It also checks the data landed. `./scripts/demo-data.sh reset` wipes the `demo` index.
 
 ### Step 2 — What do we have?
 
@@ -440,6 +496,42 @@ Run any search above, then choose **Save As → Dashboard Panel → New Dashboar
 
 > **Splunk Free vs. trial:** Free supports searches and dashboards. **Alerts** (e.g. "email me when error_rate_pct > 5" or "when failures > 10 from one IP") and scheduled reports need the Enterprise trial. Set `SPLUNK_LICENSE_URI=` (empty) in `.env` and run `./scripts/reset.sh`.
 
+### Step 9 — Catch an incident as it happens
+
+This is the most convincing part: break things live and watch Splunk show it.
+
+1. **Laptop, terminal 1:** `./app-emulator.sh live` (leave it running)
+2. **Splunk Web:** run this with the time picker set to **Real-time → 5 minute window**, and the **Visualization** tab on a line chart:
+
+   ```
+   index=demo sourcetype=api:access
+   | timechart span=10s count(eval(status>=500)) as errors avg(latency_ms) as avg_latency_ms
+   ```
+
+3. **Laptop, terminal 2:** `./app-emulator.sh outage`. Within seconds, errors and latency jump on the chart.
+4. Investigate while it's happening, with the time range set to **Last 15 minutes**:
+
+   ```
+   index=demo sourcetype=api:access status>=500 | stats count by path error
+   ```
+   ```
+   index=demo sourcetype=integration:run status=failed | stats count by flow target error
+   ```
+
+5. **Laptop, terminal 2:** `./app-emulator.sh attack`. Then hunt for it:
+
+   ```
+   index=demo sourcetype=auth result=failure earliest=-15m
+   | stats count by client_ip user
+   ```
+   ```
+   index=demo client_ip=185.220.101.45 earliest=-15m
+   | table _time sourcetype user result path query bytes
+   | sort _time
+   ```
+
+Put the real-time error chart and the failed-login count on a dashboard (Step 8), and you have a live ops/security wall screen fed entirely by HTTP POSTs from an app.
+
 ### Why this matters
 
 - **No schema up front.** You sent JSON, and every field was searchable immediately. Questions you didn't plan for are still answerable.
@@ -516,6 +608,8 @@ docker exec -it splunk sudo -u splunk /opt/splunk/bin/splunk status
 | Clicking port 8000 jumps to `localhost:8000` / "not ready" | Splunk Web is redirecting to localhost. Run `./scripts/configure-proxy.sh` (runs automatically on start) — it sets `tools.proxy.base` to the Codespace URL in a small `codespace_proxy` app |
 | Port 8000 shows 502 / not responding | Splunk is still booting — run `./scripts/status.sh`, wait 2–4 min on first boot |
 | `scripts/start.sh: Permission denied` | `chmod +x scripts/*.sh` (or run with `bash scripts/start.sh`); to fix permanently: `git update-index --chmod=+x scripts/*.sh` and commit |
+| REST call to `localhost:8089` returns `401` (even with the right password) | Expected on the Free license — remote management is disabled. Run it inside the container: `docker exec splunk sh -c 'curl -sk -u "admin:$SPLUNK_PASSWORD" https://localhost:8089/...'` |
+| `Requires license feature='Auth'` when changing the password | The Free license has no user management, so the admin password can't be changed. Use the Enterprise trial if you need it |
 | Container exits immediately | `./scripts/logs.sh` — usually a password under 8 characters or a license-acceptance error |
 | `minimum free disk space` error | Splunk needs ≥5 GB free: `df -h`, delete old backups, or use a larger machine |
 | Slow / out of memory | Use a 4-core (16 GB) or larger Codespace machine type |
