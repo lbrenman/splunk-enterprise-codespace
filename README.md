@@ -559,7 +559,9 @@ After editing `.env`:
 docker compose up -d   # recreates the container; volumes are kept
 ```
 
-> Changing `SPLUNK_PASSWORD` after first boot does **not** change the existing admin password (it's stored in `splunk-etc`). Change it in Splunk Web or run `./scripts/reset.sh`.
+> Changing `SPLUNK_PASSWORD` after first boot does **not** change the existing admin password (it's stored in `splunk-etc`). On the **Free license the password can't be changed** ("Requires license feature='Auth'"). The only way to apply a new one is `./scripts/reset.sh`, which wipes all data and re-runs first boot with the password from `.env`. With the Enterprise trial you can change it with `splunk edit user admin -password <new> -auth admin:<old>` inside the container.
+>
+> To change the **HEC token**, don't edit `.env` by hand. Run `./scripts/rotate-hec-token.sh`, which updates both `.env` and Splunk.
 
 ---
 
@@ -593,6 +595,34 @@ docker exec -it splunk sudo -u splunk /opt/splunk/bin/splunk status
 
 ---
 
+## Freeing up space
+
+A Codespace has limited disk (32 GB on the default machine), and Splunk refuses to index data when less than 5 GB is free.
+
+### See what's using space
+
+```bash
+df -h /                         # free space in the Codespace
+docker system df                # Docker images vs. volumes
+docker exec -u root splunk sh -c 'du -sh /opt/splunk/var/lib/splunk/* | sort -h | tail'   # size per index
+ls -lh backups/ 2>/dev/null     # backups from ./scripts/backup.sh
+```
+
+Your demo data is usually small. Thousands of events take only a few MB. Splunk's own internal indexes (`_internal`, `_introspection`) typically grow faster than your data.
+
+### Remove data
+
+| Command | What it removes | What's kept |
+|---|---|---|
+| `./scripts/demo-data.sh reset` | All events in the `demo` index (Splunk restarts and recreates it empty) | Everything else |
+| `./scripts/reset.sh` | **Everything**: all indexes, including `main` and Splunk's internal logs, plus apps, dashboards and saved searches | `.env` (same HEC token) |
+| `rm backups/*.tar.gz` | Old backups | Splunk data |
+| `docker image prune` | Unused Docker images (usually there's only the Splunk image) | Running containers, volumes |
+
+After `./scripts/reset.sh`, run `./scripts/start.sh`. Splunk does a fresh first boot, and `start.sh` reapplies the Splunk Web proxy fix and recreates the `demo` index. Dashboards and saved searches are gone after a reset, so back them up first if you want to keep them.
+
+---
+
 ## Security
 
 - Codespace ports are **Private** by default — only you (signed in to GitHub) can reach them. Keep it that way for 8000/8089.
@@ -613,10 +643,10 @@ docker exec -it splunk sudo -u splunk /opt/splunk/bin/splunk status
 | `Requires license feature='Auth'` when changing the password | The Free license has no user management, so the admin password can't be changed. Use the Enterprise trial if you need it |
 | `hec-info.sh` warns the token is the placeholder (all zeros) | Run `./scripts/rotate-hec-token.sh` — it sets a new random token in `.env` and Splunk and verifies it. Then update any senders with the new token |
 | Container exits immediately | `./scripts/logs.sh` — usually a password under 8 characters or a license-acceptance error |
-| `minimum free disk space` error | Splunk needs ≥5 GB free: `df -h`, delete old backups, or use a larger machine |
+| `minimum free disk space` error | Splunk needs ≥5 GB free. See [Freeing up space](#freeing-up-space), or use a larger machine |
 | Slow / out of memory | Use a 4-core (16 GB) or larger Codespace machine type |
 | `docker: Cannot connect to the Docker daemon` | Wait a few seconds after start, then `./scripts/start.sh` |
-| HEC returns `Invalid token` | Token in `.env` changed after first boot — HEC token is set on first boot; reset or add a new token in **Settings → Data Inputs → HTTP Event Collector** |
+| HEC returns `Invalid token` | The sender is using an old token, e.g. from a previous Codespace or before a rotation. Get the current one with `./scripts/hec-info.sh`. If `.env` was edited by hand and no longer matches Splunk, run `./scripts/rotate-hec-token.sh` to resync both |
 | Forgot settings after rebuild | Check volumes exist: `docker volume ls` (should list `splunk-etc`, `splunk-var`) |
 
 ---
